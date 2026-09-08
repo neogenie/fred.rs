@@ -62,9 +62,33 @@ async fn create_replica_connection(
     // `Router::refresh_replica_routing` to rebuild the routing table the retry needs. The global
     // reconnection counter is left alone on purpose -- spending it here would drain the budget the
     // primary connection shares, and resetting it on success would mask earlier primary failures.
-    let attempt = router.replicas.add_connection(inner, primary, replica, true).await;
+    let attempt = router
+      .replicas
+      .add_connection(inner, primary, replica.clone(), true)
+      .await;
 
     if let Err(err) = attempt {
+      // The dial failed, so take the replica out of the routing table before falling back.
+      //
+      // `Replicas::add_connection` returns early from `connection::create`, which is *before* it
+      // reaches `self.routing.add` -- but the entry is already there, put in by the lazy path when
+      // the client connected. Nothing else takes it out: `drop_broken_connections` walks
+      // `self.connections` and reaps only replicas that *have* a socket with reader errors, and a
+      // replica whose dial failed has no socket at all.
+      //
+      // So the entry survives, and it is not inert. `route_replica` keeps resolving to it, which
+      // lands every later replica read back here to pay another `internal_command_timeout` inline
+      // on the router task -- serially, ahead of every queued command, including commands bound for
+      // a healthy primary. Measured against a frozen replica: 523 dials, 518 failures, one every
+      // ten seconds, with the client making no other progress in between.
+      //
+      // Removing it makes `route_replica` fail immediately instead, so `primary_fallback` serves
+      // subsequent reads from the primary at once and the stall is paid once rather than once per
+      // command. Recovery does not depend on the entry being kept: the routing table is rebuilt
+      // from `CLUSTER SLOTS` by `Router::refresh_replica_routing` on every cluster sync, which is
+      // also how a replica the client has never seen before is picked up.
+      router.replicas.remove_replica(&replica);
+
       if inner.connection.replica.ignore_reconnection_errors {
         _warn!(
           inner,
