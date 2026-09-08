@@ -799,7 +799,22 @@ impl Connection {
     flush: bool,
     check_unresponsive: bool,
   ) -> Result<(), Error> {
-    if check_unresponsive {
+    // Stamped only when nothing is already being timed, so this measures how long the *oldest*
+    // unanswered frame has been waiting.
+    //
+    // `UnresponsiveConfig::max_timeout` is documented as "the amount of time a frame can wait
+    // without a response", and overwriting the stamp on every write does not measure that -- it
+    // measures the gap between consecutive writes. Any caller that writes to a socket more often
+    // than `max_timeout` pushes the deadline out for ever, so the socket is never condemned however
+    // long it has been silent, and a caller retrying a failing read is exactly the case the setting
+    // exists for. A replica that accepts TCP and then stops answering -- a paused container, a
+    // blackholed route -- is held open indefinitely while every read routed to it times out.
+    //
+    // The stamp is cleared by any successful read (`router::types::poll_connection`), so `Some`
+    // here means a frame went out and nothing has come back since, which is the condition being
+    // timed. A healthy idle connection has had its stamp cleared by the response it was waiting
+    // for, so this cannot condemn one.
+    if check_unresponsive && self.last_write.is_none() {
       self.last_write = Some(Instant::now());
     }
 
